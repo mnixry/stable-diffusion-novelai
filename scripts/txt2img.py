@@ -187,6 +187,12 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--hypernet",
+        type=str,
+        default="",
+        help="if set, load and use this hypernet"
+    )
     opt = parser.parse_args()
     seed_everything(opt.seed)
 
@@ -200,6 +206,21 @@ def main():
         sampler = PLMSSampler(model)
     else:
         sampler = DDIMSampler(model)
+
+    if len(opt.hypernet) > 0:
+        from ldm.modules.attention import CrossAttention, HyperLogic
+        network = {
+            768: (HyperLogic(768).to(device), HyperLogic(768).to(device)),
+            1280: (HyperLogic(1280).to(device), HyperLogic(1280).to(device)),
+            640: (HyperLogic(640).to(device), HyperLogic(640).to(device)),
+            320: (HyperLogic(320).to(device), HyperLogic(320).to(device)),
+        }
+        states = torch.load(opt.hypernet)
+        for k in states.keys():
+            network[k][0].load_state_dict(states[k][0])
+            network[k][1].load_state_dict(states[k][1])
+        
+        CrossAttention.set_hypernetwork(network)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir

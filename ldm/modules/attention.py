@@ -150,6 +150,39 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
+    hypernetwork = None
+    noise_cond = False
+    def set_hypernetwork(hypernetwork):
+        CrossAttention.hypernetwork = hypernetwork
+    def set_noise_cond(nc):
+        CrossAttention.noise_cond = nc
+
+    # mix conditioning vectors for prompts
+    def prompt_mixing(prompt_body, batch_size):
+        if "|" in prompt_body:
+            prompt_parts = prompt_body.split("|")
+            prompt_total_power = 0
+            prompt_sum = None
+            for prompt_part in prompt_parts:
+                prompt_power = 1
+                if ":" in prompt_part:
+                    prompt_sub_parts = prompt_part.split(":")
+                    try:
+                        prompt_power = float(prompt_sub_parts[1])
+                        prompt_part = prompt_sub_parts[0]
+                    except:
+                        print("Error parsing prompt power! Assuming 1")
+                prompt_vector = CrossAttention._hack_model.get_learned_conditioning([prompt_part])
+                if prompt_sum is None:
+                    prompt_sum = prompt_vector * prompt_power
+                else:
+                    prompt_sum = prompt_sum + (prompt_vector * prompt_power)
+                prompt_total_power = prompt_total_power + prompt_power
+            return CrossAttention.fix_batch(prompt_sum / prompt_total_power, batch_size)
+        else:
+            return CrossAttention.fix_batch(CrossAttention._hack_model.get_learned_conditioning([prompt_body]), batch_size)
+
+    
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
         inner_dim = dim_head * heads
@@ -173,8 +206,15 @@ class CrossAttention(nn.Module):
 
         q = self.to_q(x)
         context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
+        if CrossAttention.hypernetwork is not None and context.shape[2] in CrossAttention.hypernetwork:
+            if context.shape[1] == 77 and CrossAttention.noise_cond:
+                context = context + (torch.randn_like(context) * 0.1)
+            h_k, h_v = CrossAttention.hypernetwork[context.shape[2]]
+            k = self.to_k(h_k(context))
+            v = self.to_v(h_v(context))
+        else:
+            k = self.to_k(context)
+            v = self.to_v(context)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -209,10 +249,11 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
-
     def _forward(self, x, context=None):
+        pass#return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+
+    def forward(self, x, context=None):
+        #print("BTB Forward")
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
@@ -265,3 +306,13 @@ class SpatialTransformer(nn.Module):
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
         x = self.proj_out(x)
         return x + x_in
+
+class HyperLogic(torch.nn.Module):
+    logic_multiplier = 1.0
+    def __init__(self, dim, heads=0):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(dim, dim*2)
+        self.linear2 = torch.nn.Linear(dim*2, dim)
+
+    def forward(self, _x):
+        return _x + (self.linear2(self.linear1(_x)) * HyperLogic.logic_multiplier)
