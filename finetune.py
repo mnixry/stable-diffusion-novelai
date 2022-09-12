@@ -54,9 +54,10 @@ def process_tags(tags, min_tags=1, max_tags=32, type_dropout = 0.75, keep_jpeg_a
     final_tags = {}
 
     tag_dict = {tag: True for tag in tags}
+    pure_tag_dict = {tag.split(":", 1)[-1]: tag for tag in tags}
     for bad_tag in ["absurdres", "highres", "translation_request", "translated", "commentary", "commentary_request", "commentary_typo", "character_request", "bad_id", "bad_link", "bad_pixiv_id", "bad_twitter_id", "bad_tumblr_id", "bad_deviantart_id", "bad_nicoseiga_id", "md5_mismatch", "cosplay_request", "artist_request", "wide_image", "author_request"]:
-        if bad_tag in tag_dict:
-            del tag_dict[bad_tag]
+        if bad_tag in pure_tag_dict:
+            del tag_dict[pure_tag_dict[bad_tag]]
 
     if "rating:questionable" in tag_dict or "rating:explicit" in tag_dict:
         final_tags["nsfw"] = True
@@ -82,7 +83,7 @@ def process_tags(tags, min_tags=1, max_tags=32, type_dropout = 0.75, keep_jpeg_a
 
     skip_image = False
     for bad_tag in ["comic", "panels", "everyone", "sample_watermark", "text_focus", "tagme"]:
-        if bad_tag in tag_dict:
+        if bad_tag in pure_tag_dict:
             skip_image = True
     if not keep_jpeg_artifacts and "jpeg_artifacts" in tag_dict:
         skip_image = True
