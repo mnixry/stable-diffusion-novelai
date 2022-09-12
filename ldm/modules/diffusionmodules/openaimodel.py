@@ -7,6 +7,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ck
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -248,10 +249,12 @@ class ResBlock(TimestepBlock):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
-
+        #return checkpoint(
+        #    self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        #)
+        return ck(self._forward, x, emb)
+        #return self._forward(x, emb)
+        
 
     def _forward(self, x, emb):
         if self.updown:
@@ -313,9 +316,17 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
-        #return pt_checkpoint(self._forward, x)  # pytorch
+        #return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        #return ck(self._forward, x)  # pytorch
+        #return self._forward(x)
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
+    '''
     def _forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
@@ -323,6 +334,7 @@ class AttentionBlock(nn.Module):
         h = self.attention(qkv)
         h = self.proj_out(h)
         return (x + h).reshape(b, c, *spatial)
+    '''
 
 
 def count_flops_attn(model, _x, y):
