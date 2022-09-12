@@ -5,6 +5,7 @@ from functools import partial
 
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
 from ldm.util import default
+from transformers import CLIPModel
 
 
 class AbstractEncoder(nn.Module):
@@ -146,11 +147,35 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from huggingface)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77):  # clip-vit-base-patch32
         super().__init__()
+        print("\n\n\n\n\nStarted frozen clip class\n\n\n\n")
+        import traceback
+        traceback.print_exc()
+        self.use_prior = False
+        self.return_layer = None # set: model.cond_stage_model.return_layer = -2 # penultimate layer
+        self.do_final_ln = False # set: model.cond_stage_model.do_final_ln = True # make it kinda work right away (or don't and let the model figure it out)
+        #config = CLIPConfig.from_pretrained(version)
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version)
+        self.transformer = CLIPModel.from_pretrained(version).text_model #CLIPTextModel.from_pretrained(version, config=config.text_config)
         self.device = device
         self.max_length = max_length   # TODO: typical value?
         self.freeze()
+
+        self.token_mults = {}
+        tokens_with_parens = [(k, v) for k, v in self.tokenizer.get_vocab().items() if '(' in k or ')' in k or '[' in k or ']' in k]
+        fac = 1.05
+        for text, ident in tokens_with_parens:
+            mult = 1.0
+            for c in text:
+                if c == '[':
+                    mult /= fac
+                if c == ']':
+                    mult *= fac
+                if c == '(':
+                    mult *= fac
+                if c == ')':
+                    mult /= fac
+            if mult != 1.0:
+                self.token_mults[ident] = mult
 
     def freeze(self):
         self.transformer = self.transformer.eval()
@@ -159,17 +184,60 @@ class FrozenCLIPEmbedder(AbstractEncoder):
             param.requires_grad = False
 
     def forward(self, text):
-        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
-                                        return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-        tokens = batch_encoding["input_ids"].to(self.device)
-        outputs = self.transformer(input_ids=tokens)
+        #batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
+        #                                return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
 
-        z = outputs.last_hidden_state
+        remade_batch_tokens = []
+        cache = {}
+        batch_tokens = self.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
+        batch_multipliers = []
+        for tokens in batch_tokens:
+            fixes = []
+            remade_tokens = []
+            multipliers = [1.0]
+            mult = 1.0
+
+            for token in tokens:
+                mult_change = self.token_mults.get(token)
+                if mult_change is not None:
+                    mult *= mult_change
+                else:
+                    remade_tokens.append(token)
+                    multipliers.append(mult)
+            remade_tokens = [self.tokenizer.bos_token_id] + remade_tokens[:75] + [self.tokenizer.eos_token_id]
+            multipliers.append(1.0)
+            need = (77-len(remade_tokens))
+            if need > 1:
+                remade_tokens.extend([self.tokenizer.eos_token_id] * need)
+                multipliers.extend([1.0] * need)
+
+            remade_batch_tokens.append(remade_tokens)
+            batch_multipliers.append(multipliers)
+
+
+        tokens = torch.tensor(remade_batch_tokens).to(self.device)
+        outputs = self.transformer(input_ids=tokens, output_hidden_states=self.return_layer is not None, return_dict=True)
+
+        if self.return_layer is not None:
+            z = outputs.hidden_states[self.return_layer]
+            if self.do_final_ln:
+                z = self.transformer.final_layer_norm(z)
+        else:
+            z = outputs.last_hidden_state
+
+        original_mean = z.mean()
+        batch_multipliers = torch.tensor(batch_multipliers).to(z.device).to(z.dtype)
+        #z *= batch_multipliers.reshape(batch_multipliers.shape + (1,)).expand(z.shape)
+        new_mean = z.mean()
+        z *= original_mean / new_mean
+
+        if self.use_prior:
+            z = self.prior(z)
+
         return z
 
     def encode(self, text):
         return self(text)
-
 
 class SpatialRescaler(nn.Module):
     def __init__(self,

@@ -258,6 +258,8 @@ def main(rank, global_rank, world_size, args):
     #model = lm_utils.load_from_path("/home/xuser/nvme1/pretrained/gpt-j-base").half().to(rank)
     outer_model = no_init(lambda: StableDiffusionModel("/mnt/storageserver/workspace/kuru/sdfinetune/models/v14", None)).float()
     outer_model = outer_model.to(rank)
+    outer_model.model.cond_stage_model.return_layer = -2
+    outer_model.model.cond_stage_model.do_final_ln = True
     #outer_model.model.first_stage_model.load_state_dict(clean_dict(torch.load("/home/xuser/nvme1/workspace/aero/stable/sdfinetune/stable-diffusion/logs/animefinetune94525916/checkpoints/last.ckpt")['state_dict']))
     #outer_model.model.first_stage_model = outer_model.model.first_stage_model.to(rank).float()
     #fsdp_model = DDP(model, device_ids=[rank], output_device=rank, gradient_as_bucket_view=True)
