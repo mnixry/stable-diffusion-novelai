@@ -153,7 +153,8 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         self.use_prior = False
         self.return_layer = None # set: model.cond_stage_model.return_layer = -2 # penultimate layer
         self.do_final_ln = False # set: model.cond_stage_model.do_final_ln = True # make it kinda work right away (or don't and let the model figure it out)
-        #config = CLIPConfig.from_pretrained(version)
+        self.inference_mode = True # processes () and []
+        self.emphasis_factor = 1.05 # strength of () and []
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPModel.from_pretrained(version).text_model #CLIPTextModel.from_pretrained(version, config=config.text_config)
         self.device = device
@@ -162,7 +163,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
 
         self.token_mults = {}
         tokens_with_parens = [(k, v) for k, v in self.tokenizer.get_vocab().items() if '(' in k or ')' in k or '[' in k or ']' in k]
-        fac = 1.05
+        fac = self.emphasis_factor
         for text, ident in tokens_with_parens:
             mult = 1.0
             for c in text:
@@ -184,10 +185,39 @@ class FrozenCLIPEmbedder(AbstractEncoder):
             param.requires_grad = False
 
     def forward(self, text):
-        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
-                                        return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
+        if self.inference_mode:
+            remade_batch_tokens = []
+            cache = {}
+            batch_tokens = self.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
+            batch_multipliers = []
+            for tokens in batch_tokens:
+                fixes = []
+                remade_tokens = [self.tokenizer.bos_token_id]
+                multipliers = [1.0]
+                mult = 1.0
 
-        tokens = batch_encoding["input_ids"].to(self.device)
+                for token in tokens:
+                    mult_change = self.token_mults.get(token)
+                    if mult_change is not None:
+                        mult *= mult_change
+                    else:
+                        remade_tokens.append(token)
+                        multipliers.append(mult)
+                remade_tokens = remade_tokens[:76] + [self.tokenizer.eos_token_id]
+                multipliers = multipliers[:76] + [1.0]
+                need = (77-len(remade_tokens))
+                if need > 1:
+                    remade_tokens.extend([self.tokenizer.eos_token_id] * need)
+                    multipliers.extend([1.0] * need)
+
+                remade_batch_tokens.append(remade_tokens)
+                batch_multipliers.append(multipliers)
+
+
+            tokens = torch.tensor(remade_batch_tokens).to(self.device)
+        else:
+            tokens = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True, return_overflowing_tokens=False, padding="max_length", return_tensors="pt")["input_ids"].to(self.device)
+
         outputs = self.transformer(input_ids=tokens, output_hidden_states=self.return_layer is not None, return_dict=True)
 
         if self.return_layer is not None:
@@ -197,8 +227,15 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         else:
             z = outputs.last_hidden_state
 
-        if self.use_prior:
-            z = self.prior(z)
+        if self.inference_mode:
+            original_mean = z.mean()
+            batch_multipliers = torch.tensor(batch_multipliers).to(z.device).to(z.dtype)
+            z *= batch_multipliers.reshape(batch_multipliers.shape + (1,)).expand(z.shape)
+            new_mean = z.mean()
+            z *= original_mean / new_mean
+
+            if self.use_prior:
+                z = self.prior(z)
 
         return z
 
