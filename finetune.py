@@ -19,6 +19,13 @@ from inference import *
 import random
 import pickle
 
+# The flag below controls whether to allow TF32 on matmul. This flag defaults to False
+# in PyTorch 1.12 and later.
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
+torch.backends.cudnn.allow_tf32 = True
+
 def clean_dict(d):
     ret_dict = {}
     for k in d.keys():
@@ -48,22 +55,32 @@ def get_world():
     if dist.is_initialized():
         return dist.get_world_size()
 
-def process_tags(tags, min_tags=1, max_tags=32, type_dropout = 0.75, keep_jpeg_artifacts=True, sort_tags=True):
+def process_tags(tags, min_tags=1, max_tags=32, type_dropout=0.75, keep_important=1.00, keep_jpeg_artifacts=True, sort_tags=True):
     if isinstance(tags, str):
         tags = tags.split(" ")
     final_tags = {}
 
     tag_dict = {tag: True for tag in tags}
     pure_tag_dict = {tag.split(":", 1)[-1]: tag for tag in tags}
-    for bad_tag in ["absurdres", "highres", "translation_request", "translated", "commentary", "commentary_request", "commentary_typo", "character_request", "bad_id", "bad_link", "bad_pixiv_id", "bad_twitter_id", "bad_tumblr_id", "bad_deviantart_id", "bad_nicoseiga_id", "md5_mismatch", "cosplay_request", "artist_request", "wide_image", "author_request"]:
+    for bad_tag in ["absurdres", "highres", "translation_request", "translated", "commentary", "commentary_request", "commentary_typo", "character_request", "bad_id", "bad_link", "bad_pixiv_id", "bad_twitter_id", "bad_tumblr_id", "bad_deviantart_id", "bad_nicoseiga_id", "md5_mismatch", "cosplay_request", "artist_request", "wide_image", "author_request", "artist_name"]:
         if bad_tag in pure_tag_dict:
             del tag_dict[pure_tag_dict[bad_tag]]
 
     if "rating:questionable" in tag_dict or "rating:explicit" in tag_dict:
         final_tags["nsfw"] = True
 
+    base_chosen = []
+    for tag in tag_dict.keys():
+        parts = tag.split(":", 1)
+        if parts[0] in ["artist", "copyright", "character"] and random.random() < keep_important:
+            base_chosen.append(tag)
+        if parts[-1][0] in ["1", "2", "3", "4", "5", "6"] and parts[-1][1:] in ["boy", "boys", "girl", "girls"]:
+            base_chosen.append(tag)
+        if parts[-1] in ["6+girls", "6+boys", "bad_anatomy", "bad_hands"]:
+            base_chosen.append(tag)
+
     tag_count = min(random.randint(min_tags, max_tags), len(tag_dict.keys()))
-    chosen_tags = random.sample(list(tag_dict.keys()), tag_count)
+    chosen_tags = list(set(base_chosen + random.sample(list(tag_dict.keys()), tag_count)))
     if sort_tags:
         chosen_tags = sorted(chosen_tags)
     for tag in chosen_tags:
@@ -89,6 +106,7 @@ def process_tags(tags, min_tags=1, max_tags=32, type_dropout = 0.75, keep_jpeg_a
         skip_image = True
 
     return "Tags: " + ", ".join(list(final_tags.keys()))
+    #return ", ".join(list(final_tags.keys()))
 
 def fsdp_train(args, model, train_loader, opt):
     bs = args["bs"]
@@ -113,12 +131,12 @@ def fsdp_train(args, model, train_loader, opt):
         tags_batch = []
         for id in ids:
             tags = db_tags[id.item()]
-            tags = process_tags(tags, min_tags=1, max_tags=16)
+            tags = process_tags(tags, min_tags=args["min_tags"], max_tags=args["max_tags"])
             tags_batch.append(tags)
 
         #copy
         tags_batch_original = tags_batch.copy()
-        ucg = 0.1
+        ucg = args["ucg"]
         if ucg:
             ucg = int(len(tags_batch) * ucg)
             numbers = random.sample(range(len(tags_batch)), ucg)
@@ -159,6 +177,10 @@ def fsdp_train(args, model, train_loader, opt):
 
         opt.zero_grad()
         #model.zero_grad(set_to_none=True)
+        #do ema
+        if args["use_ema"]:
+            model.model.model_ema(model.model.model)
+
         sec_per_step = (time.perf_counter() - timex)
         step_per_sec = (1. / sec_per_step)
         batch_size = bs * gas * world_size
@@ -174,7 +196,7 @@ def fsdp_train(args, model, train_loader, opt):
                 "train/loss_scale": scaler.get_scale(),
                 })
         
-        if counter % args["save_every"] == 0:
+        if args["do_save"] and counter % args["save_every"] == 0:
             if global_rank == 0:
                 torch.save(model.model.state_dict(), f"{args['save_path']}/{args['run_name']}-{counter}.pt")
 
@@ -187,49 +209,64 @@ def fsdp_train(args, model, train_loader, opt):
                 req = model.get_default_config
                 req.n_samples = 4
                 req.steps = 35
-                req.prompt = "Anime girl looking at the sky"
+                req.prompt = "An anime girl with black shorts laying down on the bed, looking at you, trending on pixiv"
                 req.seed = 42
-                images = model.sample(req)
+                images = model.sample(req, ema=False)
                 imagesx = [Image.fromarray(image) for image in images]
                 imagesx = [wandb.Image(image, caption=req.prompt) for image in imagesx]
+                images = model.sample(req)
+                imagesx_ema = [Image.fromarray(image) for image in images]
+                imagesx_ema = [wandb.Image(image, caption=req.prompt + ":ema") for image in imagesx_ema]
 
                 req = model.get_default_config
                 req.n_samples = 4
                 req.steps = 35
                 req.prompt = "Tags: 1girl, long hair, smile, blue eyes, open mouth, brown hair"
                 req.seed = 42
-                images = model.sample(req)
+                images = model.sample(req, ema=False)
                 imagesy = [Image.fromarray(image) for image in images]
                 imagesy = [wandb.Image(image, caption=req.prompt) for image in imagesy]
+                images = model.sample(req)
+                imagesy_ema = [Image.fromarray(image) for image in images]
+                imagesy_ema = [wandb.Image(image, caption=req.prompt + ":ema") for image in imagesy_ema]
 
                 req = model.get_default_config
                 req.n_samples = 4
                 req.steps = 35
                 req.prompt = "Tags: red bikini"
                 req.seed = 42
-                images = model.sample(req)
+                images = model.sample(req, ema=False)
                 imagesz = [Image.fromarray(image) for image in images]
                 imagesz = [wandb.Image(image, caption=req.prompt) for image in imagesz]
+                images = model.sample(req)
+                imagesz_ema = [Image.fromarray(image) for image in images]
+                imagesz_ema = [wandb.Image(image, caption=req.prompt + ":ema") for image in imagesz_ema]
 
                 req = model.get_default_config
                 req.n_samples = 4
                 req.steps = 35
                 req.prompt = "Tags: red bikini, hatsune miku"
                 req.seed = 42
-                images = model.sample(req)
+                images = model.sample(req, ema=False)
                 imageso = [Image.fromarray(image) for image in images]
                 imageso = [wandb.Image(image, caption=req.prompt) for image in imageso]
-
-                imageslog = imagesx + imagesy + imagesz + imageso
-                
+                images = model.sample(req)
+                imageso_ema = [Image.fromarray(image) for image in images]
+                imageso_ema = [wandb.Image(image, caption=req.prompt + ":ema") for image in imageso_ema]
+        
+                imageslog = imagesx + imagesy + imagesz + imageso + imagesx_ema + imagesy_ema + imagesz_ema + imageso_ema
                 req = model.get_default_config
                 req.n_samples = 4
                 req.steps = 35
                 req.prompt = tags_batch_original[0]
                 req.seed = 42
-                images = model.sample(req)
+                images = model.sample(req, ema=False)
                 imagesrandom = [Image.fromarray(image) for image in images]
                 imagesrandom = [wandb.Image(image, caption=req.prompt) for image in imagesrandom]
+                images = model.sample(req)
+                imagesrandom_ema = [Image.fromarray(image) for image in images]
+                imagesrandom_ema = [wandb.Image(image, caption=req.prompt + ":ema") for image in imagesrandom_ema]
+                imagesrandom = imagesrandom + imagesrandom_ema
                 wandb.log({"examples": imageslog, "examples_random": imagesrandom})
                 
                 torch.set_rng_state(torch_random_state)
@@ -256,7 +293,7 @@ def main(rank, global_rank, world_size, args):
     Path(args["save_path"]).mkdir(parents=True, exist_ok=True)
 
     #model = lm_utils.load_from_path("/home/xuser/nvme1/pretrained/gpt-j-base").half().to(rank)
-    outer_model = no_init(lambda: StableDiffusionModel("/mnt/storageserver/workspace/kuru/sdfinetune/models/v14", None)).float()
+    outer_model = no_init(lambda: StableDiffusionModel(args["model_path"], None, mode=args["mode"])).float()
     outer_model = outer_model.to(rank)
     outer_model.model.cond_stage_model.return_layer = -2
     outer_model.model.cond_stage_model.do_final_ln = True
@@ -275,8 +312,9 @@ def main(rank, global_rank, world_size, args):
     # TODO: Add load, add evals, add FP16 AMP, and Data Parallel, outputting hidden states from the get_logits function.
     print(opt.curr_step)
 
-    train_dataset = dataset.ShardedImageDataset(dataset_path="/mnt/storageserver/workspace/kuru/sdfinetune/dataset/700kdanbooru", name="smalldanbooru", shuffle=False,
+    train_dataset = dataset.ShardedImageDataset(dataset_path=args["data_path"], name="smalldanbooru", shuffle=False,
     bsz=bs*gas, threads=8, inner_transform=inner_transform, world_size=world_size, local_rank=rank, global_rank=global_rank)
+    #train_dataset.shard(shuffle=True, epoch=10, seed=args["seed"])
 
     train_loader = data.DataLoader(train_dataset, batch_size=None, shuffle=False, num_workers=0, )
     if global_rank == 0:
@@ -293,27 +331,36 @@ def main(rank, global_rank, world_size, args):
 
 if __name__ == "__main__":
     train_config = {
-        "data_path": "/home/xuser/nvme1/dataset/sigurd-1G.map",
-        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/anime700k-128bs-01ucg",
+        "data_path": "/mnt/storageserver/workspace/kuru/sdfinetune/dataset/700kdanbooru",
+        #"model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/anime700k-64bs-0.1ucg-penultimate-clip-1epoch-ema-restore",
+        "model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/v14",
+        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/anime700k-64bs-0.1ucg-penultimate-clip-1epoch-50-50prompt",
         "do_save": True,
-        "run_name": "anime700k-128bs-01ucg",
+        "run_name": "anime700k-64bs-0.1ucg-penultimate-1epoch-clip-ema-50-50prompt",
         "lr": 1e-5,
         "end_lr": 8e-6,
         "warmup_steps": 100,
-        "anneal_steps": 7850,
+        #"anneal_steps": 80000,
+        "anneal_steps": 7850*2,
         "bs": 8,
-        "gas": 2,
+        "gas": 1,
         "seed": 69,
-        "save_every": 1000,
-        "amp": True,
-        "loss_scale": True,
+        #"seed": 42,
+        "save_every": 1000*2,
+        "amp": False,
+        "loss_scale": False,
         "cast_to": torch.float16,
         "contrastive_loss": False,
-        "sample_every": 250,
+        "sample_every": 250*2,
         "beta1": 0.95,
         "beta2": 0.999,
         "eps": 1e-8,
         "weight_decay": 0.0,
+        "use_ema": True,
+        "ucg": 0.1,
+        "min_tags": 50,
+        "max_tags": 50, 
+        "mode": "stable",
     }
 
     world_size = int(os.environ["WORLD_SIZE"])

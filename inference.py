@@ -15,6 +15,7 @@ import time
 from PIL import Image
 import k_diffusion as K
 import argparse
+import contextlib
 
 def no_init(loading_code):
     def dummy(self):
@@ -196,8 +197,9 @@ class StableInterface(nn.Module):
         return x_0
 
 class StableDiffusionModel(nn.Module):
-    def __init__(self, model_path, module_path=None, dtype="float32", device="cuda"):
+    def __init__(self, model_path, module_path=None, dtype="float32", device="cuda", mode="stable"):
         nn.Module.__init__(self)
+        self.mode = mode
         if module_path:
             self.premodules = load_modules(module_path)
 
@@ -242,7 +244,10 @@ class StableDiffusionModel(nn.Module):
         pl_sd = torch.load(ckpt, map_location="cpu")
         if "global_step" in pl_sd:
             print(f"Global Step: {pl_sd['global_step']}")
-        sd = pl_sd["state_dict"]
+        if self.mode == "stable":
+            sd = pl_sd["state_dict"]
+        else:
+            sd = pl_sd
         model = instantiate_from_config(config.model)
         m, u = model.load_state_dict(sd, strict=False)
         if len(m) > 0 and verbose:
@@ -280,7 +285,12 @@ class StableDiffusionModel(nn.Module):
 
     @torch.no_grad()
     @torch.autocast("cuda", enabled=True, dtype=torch.float16)
-    def sample(self, request):
+    def sample(self, request, ema=True):
+        if ema:
+            ema_manager = self.model.ema_scope
+        else:
+            ema_manager = contextlib.nullcontext
+
         if request.module is not None:
             if request.module == "vanilla":
                 pass
@@ -373,33 +383,33 @@ class StableDiffusionModel(nn.Module):
             request.width // request.downsampling_factor
         ]
         if sampler == "normal":
-            #with self.model.ema_scope():
-            samples, _ = self.sampler_map[request.sampler](
-                S=request.steps,
-                conditioning=prompt_condition,
-                batch_size=request.n_samples,
-                shape=shape,
-                verbose=False,
-                unconditional_guidance_scale=request.scale,
-                unconditional_conditioning=uc,
-                eta=request.ddim_eta,
-                dynamic_threshold=request.dynamic_threshold,
-                x_T=start_code,
-            )
+            with ema_manager():
+                samples, _ = self.sampler_map[request.sampler](
+                    S=request.steps,
+                    conditioning=prompt_condition,
+                    batch_size=request.n_samples,
+                    shape=shape,
+                    verbose=False,
+                    unconditional_guidance_scale=request.scale,
+                    unconditional_conditioning=uc,
+                    eta=request.ddim_eta,
+                    dynamic_threshold=request.dynamic_threshold,
+                    x_T=start_code,
+                )
 
         elif sampler == "k-diffusion":
-            #with self.model.ema_scope():
-            sigmas = self.k_model.get_sigmas(request.steps)
-            if request.image is not None:
-                noise = main_noise * sigmas[request.steps - t_enc - 1]
-                start_code = start_code + noise
-                sigmas = sigmas[request.steps - t_enc - 1:]
+            with ema_manager():
+                sigmas = self.k_model.get_sigmas(request.steps)
+                if request.image is not None:
+                    noise = main_noise * sigmas[request.steps - t_enc - 1]
+                    start_code = start_code + noise
+                    sigmas = sigmas[request.steps - t_enc - 1:]
 
-            else:
-                start_code = start_code * sigmas[0]
+                else:
+                    start_code = start_code * sigmas[0]
 
-            extra_args = {'cond': prompt_condition, 'uncond': uc, 'cond_scale': request.scale}
-            samples = self.sampler_map[request.sampler](self.k_model, start_code, sigmas, extra_args=extra_args)
+                extra_args = {'cond': prompt_condition, 'uncond': uc, 'cond_scale': request.scale}
+                samples = self.sampler_map[request.sampler](self.k_model, start_code, sigmas, extra_args=extra_args)
 
         x_samples_ddim = self.model.decode_first_stage(samples)
         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
