@@ -197,13 +197,24 @@ class StableInterface(nn.Module):
         return x_0
 
 class StableDiffusionModel(nn.Module):
-    def __init__(self, model_path, module_path=None, dtype="float32", device="cuda", mode="stable"):
+    def __init__(self, model_path, config_path=None, module_path=None, dtype="float32", device="cuda", mode="stable"):
         nn.Module.__init__(self)
         self.mode = mode
+        self.config_path = config_path
         if module_path:
             self.premodules = load_modules(module_path)
 
-        model, model_config = self.from_folder(model_path)
+        if Path(model_path).is_dir():
+            print(f"Loading model from folder {model_path}")
+            model, model_config = self.from_folder(model_path)
+        
+        elif Path(model_path).is_file():
+            print(f"Loading model from file {model_path}")
+            model, model_config = self.from_path(model_path)
+
+        else:
+            raise Exception("Invalid model path!")
+
         if dtype == "float16":
             typex = torch.float16
         else:
@@ -237,6 +248,14 @@ class StableDiffusionModel(nn.Module):
         else:
             model_path = folder / "model.ckpt"
         model = self.load_model_from_config(model_config, model_path)
+        return model, model_config
+
+    def from_path(self, file):
+        default_config = Path(self.config_path)
+        if not default_config.is_file():
+            raise Exception("Default config to load not found! Either give a folder on MODEL_PATH or specify a config to use with this checkpoint on DEFAULT_CONFIG")
+        model_config = OmegaConf.load(default_config)
+        model = self.load_model_from_config(model_config, file)
         return model, model_config
 
     def load_model_from_config(self, config, ckpt, verbose=False):

@@ -26,6 +26,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
 torch.backends.cudnn.allow_tf32 = True
 
+dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
+
 def clean_dict(d):
     ret_dict = {}
     for k in d.keys():
@@ -151,7 +153,7 @@ def fsdp_train(args, model, train_loader, opt):
         batch["jpg"] = images
         batch["txt"] = tags_batch
         for x in range(args["gas"]):
-            with torch.cuda.amp.autocast(enabled=args["amp"], dtype=args["cast_to"]):
+            with torch.cuda.amp.autocast(enabled=args["amp"], dtype=dtype_map[args["cast_to"]]):
                 gas_loss = model.model.training_step({'jpg': batch["jpg"][x*bs:(x+1)*bs, ...], 'txt': batch['txt'][x*bs:(x+1)*bs]}, None, log=False)
 
             if args["loss_scale"]:
@@ -200,6 +202,10 @@ def fsdp_train(args, model, train_loader, opt):
         if args["do_save"] and counter % args["save_every"] == 0:
             if global_rank == 0:
                 torch.save(model.model.state_dict(), f"{args['save_path']}/{args['run_name']}-{counter}.pt")
+
+        if args["do_save"] == False:
+            if global_rank == 0:
+                print("Alert, you are NOT SAVING THE MODEL!")
 
         if counter % args["sample_every"] == 0:
             if global_rank == 0:
@@ -293,8 +299,9 @@ def main(rank, global_rank, world_size, args):
     setup(rank, world_size)
     Path(args["save_path"]).mkdir(parents=True, exist_ok=True)
 
+    config_path = args["config_path"] if "config_path" in args else None
     #model = lm_utils.load_from_path("/home/xuser/nvme1/pretrained/gpt-j-base").half().to(rank)
-    outer_model = no_init(lambda: StableDiffusionModel(args["model_path"], None, mode=args["mode"])).float()
+    outer_model = no_init(lambda: StableDiffusionModel(args["model_path"], mode=args["mode"], config_path=config_path)).float()
     outer_model = outer_model.to(rank)
     outer_model.model.cond_stage_model.return_layer = -2
     outer_model.model.cond_stage_model.do_final_ln = True
@@ -314,9 +321,9 @@ def main(rank, global_rank, world_size, args):
     # TODO: Add load, add evals, add FP16 AMP, and Data Parallel, outputting hidden states from the get_logits function.
     print(opt.curr_step)
 
-    train_dataset = dataset.ShardedImageDataset(dataset_path=args["data_path"], name="danbooru", shuffle=False,
+    train_dataset = dataset.ShardedImageDataset(dataset_path=args["data_path"], index_path=args["index_path"], name="danbooru", shuffle=False,
     bsz=bs*gas, threads=8, inner_transform=inner_transform, world_size=world_size, local_rank=rank, global_rank=global_rank)
-    train_dataset.shard(shuffle=True, epoch=5, seed=args["seed"])
+    train_dataset.shard(shuffle=True, epoch=args["epoch"], seed=args["seed"])
 
     train_loader = data.DataLoader(train_dataset, batch_size=None, shuffle=False, num_workers=0, )
     if global_rank == 0:
@@ -332,19 +339,21 @@ def main(rank, global_rank, world_size, args):
     cleanup()
 
 if __name__ == "__main__":
+    '''
     train_config = {
         "data_path": "/mnt/storageserver/workspace/kuru/sdfinetune/dataset/fulldanbooru",
+        "index_path": "/mnt/storageserver/workspace/kuru/sdfinetune/gsq.index",
         #"model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/anime700k-64bs-0.1ucg-penultimate-clip-1epoch-ema-restore",
         "model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/v14",
-        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/animefull-64bs-0.1ucg-penultimate-clip-5epoch-50-50prompt",
+        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/animeno-e-64bs-0.1ucg-penultimate-clip-6epoch-1-22prompt",
         "do_save": True,
-        "run_name": "animefull-64bs-0.1ucg-penultimate-clip-5epoch-50-50prompt",
+        "run_name": "animeno-e-64bs-0.1ucg-penultimate-clip-6epoch-1-22prompt",
         "lr": 1e-5,
         "end_lr": 5e-6,
         "warmup_steps": 100,
         #"anneal_steps": 80000,
         #"anneal_steps": 7850*2,
-        "anneal_steps": 83000 * 5,
+        "anneal_steps": 69000 * 6,
         "bs": 8,
         "gas": 1,
         "seed": 69,
@@ -361,10 +370,19 @@ if __name__ == "__main__":
         "weight_decay": 0.0,
         "use_ema": True,
         "ucg": 0.1,
-        "min_tags": 50,
-        "max_tags": 50, 
+        "min_tags": 1,
+        "max_tags": 22, 
         "mode": "stable",
+        "epoch": 6,
     }
+    '''
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("-c", "--config", type=str, required=True)
+
+    args = argparser.parse_args()
+    #read train config from yaml with OmegaConf
+    train_config = OmegaConf.load(args.config)
+    print(train_config)
 
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["LOCAL_RANK"])
