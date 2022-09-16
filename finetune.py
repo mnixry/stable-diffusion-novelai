@@ -55,7 +55,7 @@ def get_world():
     if dist.is_initialized():
         return dist.get_world_size()
 
-def process_tags(tags, min_tags=1, max_tags=32, type_dropout=0.75, keep_important=1.00, keep_jpeg_artifacts=True, sort_tags=True):
+def process_tags(tags, min_tags=1, max_tags=32, type_dropout=0.75, keep_important=1.00, keep_jpeg_artifacts=True, sort_tags=False):
     if isinstance(tags, str):
         tags = tags.split(" ")
     final_tags = {}
@@ -74,15 +74,17 @@ def process_tags(tags, min_tags=1, max_tags=32, type_dropout=0.75, keep_importan
         parts = tag.split(":", 1)
         if parts[0] in ["artist", "copyright", "character"] and random.random() < keep_important:
             base_chosen.append(tag)
-        if parts[-1][0] in ["1", "2", "3", "4", "5", "6"] and parts[-1][1:] in ["boy", "boys", "girl", "girls"]:
+        if len(parts[-1]) > 1 and parts[-1][0] in ["1", "2", "3", "4", "5", "6"] and parts[-1][1:] in ["boy", "boys", "girl", "girls"]:
             base_chosen.append(tag)
         if parts[-1] in ["6+girls", "6+boys", "bad_anatomy", "bad_hands"]:
             base_chosen.append(tag)
 
     tag_count = min(random.randint(min_tags, max_tags), len(tag_dict.keys()))
-    chosen_tags = list(set(base_chosen + random.sample(list(tag_dict.keys()), tag_count)))
+    base_chosen_set = set(base_chosen)
+    chosen_tags = base_chosen + [tag for tag in random.sample(list(tag_dict.keys()), tag_count) if tag not in base_chosen_set]
     if sort_tags:
         chosen_tags = sorted(chosen_tags)
+        
     for tag in chosen_tags:
         tag = tag.replace(",", "").replace("_", " ")
         if random.random() < type_dropout:
@@ -106,7 +108,6 @@ def process_tags(tags, min_tags=1, max_tags=32, type_dropout=0.75, keep_importan
         skip_image = True
 
     return "Tags: " + ", ".join(list(final_tags.keys()))
-    #return ", ".join(list(final_tags.keys()))
 
 def fsdp_train(args, model, train_loader, opt):
     bs = args["bs"]
@@ -297,6 +298,7 @@ def main(rank, global_rank, world_size, args):
     outer_model = outer_model.to(rank)
     outer_model.model.cond_stage_model.return_layer = -2
     outer_model.model.cond_stage_model.do_final_ln = True
+    outer_model.model.cond_stage_model.inference_mode = False
     #outer_model.model.first_stage_model.load_state_dict(clean_dict(torch.load("/home/xuser/nvme1/workspace/aero/stable/sdfinetune/stable-diffusion/logs/animefinetune94525916/checkpoints/last.ckpt")['state_dict']))
     #outer_model.model.first_stage_model = outer_model.model.first_stage_model.to(rank).float()
     #fsdp_model = DDP(model, device_ids=[rank], output_device=rank, gradient_as_bucket_view=True)
@@ -312,9 +314,9 @@ def main(rank, global_rank, world_size, args):
     # TODO: Add load, add evals, add FP16 AMP, and Data Parallel, outputting hidden states from the get_logits function.
     print(opt.curr_step)
 
-    train_dataset = dataset.ShardedImageDataset(dataset_path=args["data_path"], name="smalldanbooru", shuffle=False,
+    train_dataset = dataset.ShardedImageDataset(dataset_path=args["data_path"], name="danbooru", shuffle=False,
     bsz=bs*gas, threads=8, inner_transform=inner_transform, world_size=world_size, local_rank=rank, global_rank=global_rank)
-    #train_dataset.shard(shuffle=True, epoch=10, seed=args["seed"])
+    train_dataset.shard(shuffle=True, epoch=5, seed=args["seed"])
 
     train_loader = data.DataLoader(train_dataset, batch_size=None, shuffle=False, num_workers=0, )
     if global_rank == 0:
@@ -331,17 +333,18 @@ def main(rank, global_rank, world_size, args):
 
 if __name__ == "__main__":
     train_config = {
-        "data_path": "/mnt/storageserver/workspace/kuru/sdfinetune/dataset/700kdanbooru",
+        "data_path": "/mnt/storageserver/workspace/kuru/sdfinetune/dataset/fulldanbooru",
         #"model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/anime700k-64bs-0.1ucg-penultimate-clip-1epoch-ema-restore",
         "model_path": "/mnt/storageserver/workspace/kuru/sdfinetune/models/v14",
-        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/anime700k-64bs-0.1ucg-penultimate-clip-1epoch-50-50prompt",
+        "save_path": "/mnt/storageserver/workspace/kuru/sdfinetune/checkpoints/animefull-64bs-0.1ucg-penultimate-clip-5epoch-50-50prompt",
         "do_save": True,
-        "run_name": "anime700k-64bs-0.1ucg-penultimate-1epoch-clip-ema-50-50prompt",
+        "run_name": "animefull-64bs-0.1ucg-penultimate-clip-5epoch-50-50prompt",
         "lr": 1e-5,
-        "end_lr": 8e-6,
+        "end_lr": 5e-6,
         "warmup_steps": 100,
         #"anneal_steps": 80000,
-        "anneal_steps": 7850*2,
+        #"anneal_steps": 7850*2,
+        "anneal_steps": 83000 * 5,
         "bs": 8,
         "gas": 1,
         "seed": 69,
