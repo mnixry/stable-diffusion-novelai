@@ -162,7 +162,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         self.freeze()
 
         self.token_mults = {}
-        tokens_with_parens = [(k, v) for k, v in self.tokenizer.get_vocab().items() if '(' in k or ')' in k or '[' in k or ']' in k]
+        tokens_with_parens = [(k, v) for k, v in self.tokenizer.get_vocab().items() if '{' in k or '}' in k or '[' in k or ']' in k]
         fac = self.emphasis_factor
         for text, ident in tokens_with_parens:
             mult = 1.0
@@ -171,9 +171,9 @@ class FrozenCLIPEmbedder(AbstractEncoder):
                     mult /= fac
                 if c == ']':
                     mult *= fac
-                if c == '(':
+                if c == '{':
                     mult *= fac
-                if c == ')':
+                if c == '}':
                     mult /= fac
             if mult != 1.0:
                 self.token_mults[ident] = mult
@@ -206,7 +206,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
                 remade_tokens = remade_tokens[:76] + [self.tokenizer.eos_token_id]
                 multipliers = multipliers[:76] + [1.0]
                 need = (77-len(remade_tokens))
-                if need > 1:
+                if need >= 1:
                     remade_tokens.extend([self.tokenizer.eos_token_id] * need)
                     multipliers.extend([1.0] * need)
 
@@ -241,6 +241,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
 
     def encode(self, text):
         return self(text)
+
 
 class SpatialRescaler(nn.Module):
     def __init__(self,
